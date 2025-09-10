@@ -5,12 +5,18 @@
 import streamlit as st
 from rembg import remove
 from PIL import Image
-import numpy as np  # Note: This import is not used in the code; consider removing if unnecessary
 from io import BytesIO
-import base64
 import os
 import traceback
 import time
+import tempfile
+
+# Super-resolution (upscaling)
+try:
+    from super_image import EdsrModel, ImageLoader
+except Exception:
+    EdsrModel = None
+    ImageLoader = None
 
 # --- Step 2: Set Up Page Configuration ---
 # Here, we configure the Streamlit page layout and title.
@@ -22,6 +28,7 @@ st.set_page_config(layout="wide", page_title="Image Background Remover")
 # These can be easily adjusted if needed.
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB maximum upload size
 MAX_IMAGE_SIZE = 2000  # Maximum dimension in pixels for processing
+MAX_UPSCALED_PIXELS = 12_000_000  # Safety cap for output pixels when upscaling
 
 # --- Step 4: Helper Functions ---
 
@@ -50,6 +57,55 @@ def resize_image(image, max_size):
         new_width = int(width * (max_size / height))
 
     return image.resize((new_width, new_height), Image.LANCZOS)
+
+
+# Cached loader for the super-resolution model
+@st.cache_resource(show_spinner=False)
+def get_sr_model(scale: int):
+    """Load and cache the EDSR model for the chosen scale."""
+    if EdsrModel is None:
+        raise RuntimeError(
+            "super-image is not installed. Please install it with `pip install super-image`"
+        )
+    # Using the base EDSR weights; scale determines the head
+    model = EdsrModel.from_pretrained("eugenesiow/edsr-base", scale=scale)
+    return model
+
+
+def _preds_to_pil(preds) -> Image.Image:
+    """Convert super-image model output to a PIL.Image for display."""
+    # Prefer using library helper when available by writing to a temp file
+    # as the API exposes save_image but not direct conversion utilities.
+    if ImageLoader is None:
+        raise RuntimeError("super-image is not available")
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        ImageLoader.save_image(preds, tmp_path)
+        pil = Image.open(tmp_path).convert("RGBA") if os.path.exists(tmp_path) else None
+        if pil is None:
+            raise RuntimeError("Failed to convert upscaled output to image")
+        return pil
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+@st.cache_data(show_spinner=False)
+def upscale_image_cached(image_bytes: bytes, scale: int):
+    """Cache the upscaled result based on image bytes and scale."""
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    model = get_sr_model(scale)
+    inputs = ImageLoader.load_image(image)
+    preds = model(inputs)
+    upscaled = _preds_to_pil(preds)
+    # Return as bytes to be cache-friendly
+    buf = BytesIO()
+    upscaled.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 # Cached function to process the image.
@@ -116,6 +172,44 @@ def fix_image(upload):
             "Download fixed image", convert_image(fixed), "fixed.png", "image/png"
         )
 
+        # Optional: Upscaling feature
+        if st.session_state.get("enable_upscale"):
+            # Choose source
+            source_choice = st.session_state.get("upscale_source", "Fixed")
+            source_img = fixed if source_choice == "Fixed" else image
+            src_w, src_h = source_img.size
+            scale = st.session_state.get("upscale_scale", 2)
+            expected_pixels = src_w * src_h * (scale**2)
+            if expected_pixels > MAX_UPSCALED_PIXELS:
+                st.warning(
+                    f"Upscaled image would be too large (>{MAX_UPSCALED_PIXELS:,} pixels). "
+                    f"Try reducing the scale or using a smaller input."
+                )
+            elif EdsrModel is None or ImageLoader is None:
+                st.error(
+                    "super-image is not installed. Please run: pip install super-image"
+                )
+            else:
+                with st.spinner(
+                    "Upscaling image with EDSR… this can take a while on CPU"
+                ):
+                    # Use the original bytes of the chosen source to leverage cache
+                    buf = BytesIO()
+                    source_img.save(buf, format="PNG")
+                    upscaled_bytes = upscale_image_cached(buf.getvalue(), scale)
+                    upscaled_img = Image.open(BytesIO(upscaled_bytes))
+
+                # Show in a new container under the two columns
+                st.markdown("---")
+                st.write(f"### Upscaled Image ×{scale} :rocket:")
+                st.image(upscaled_img)
+                st.download_button(
+                    label=f"Download upscaled ×{scale}",
+                    data=upscaled_bytes,
+                    file_name=f"upscaled_x{scale}.png",
+                    mime="image/png",
+                )
+
         progress_bar.progress(100)
         processing_time = time.time() - start_time
         status_text.text(f"Completed in {processing_time:.2f} seconds")
@@ -151,6 +245,18 @@ with st.sidebar.expander("ℹ️ Image Guidelines"):
     - Supported formats: PNG, JPG, JPEG
     - Processing time depends on image size
     """)
+
+# Upscaling controls
+with st.sidebar.expander("🔼 Upscale (optional)"):
+    enable_upscale = st.checkbox(
+        "Enable upscaling (EDSR)", value=False, key="enable_upscale"
+    )
+    if enable_upscale:
+        st.selectbox("Scale", options=[2, 3, 4], index=0, key="upscale_scale")
+        st.radio("Source", options=["Fixed", "Original"], index=0, key="upscale_source")
+        st.caption(
+            "Note: Upscaling is compute-intensive. CPU can be slow. Output size is limited for safety."
+        )
 
 # --- Step 6: Process the Image ---
 # Handle uploaded image or load default if none uploaded.

@@ -1,0 +1,5 @@
+streamlit>=1.33
+rembg>=2.0.57
+Pillow>=10.0.0
+super-image>=0.1.7
+onnxruntime>=1.18.0
