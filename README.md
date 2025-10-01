@@ -17,13 +17,11 @@ Create/activate a Python 3.9+ environment, then install dependencies:
 pip install -r requirements.txt
 ```
 
-
 If you only need upscaling later, you can install it separately:
 
 ```bash
 pip install super-image
 ```
-
 
 ## Run
 
@@ -44,3 +42,4 @@ Notes:
 ## Credits
 - Background removal: https://github.com/danielgatis/rembg
 - EDSR super-resolution: https://github.com/eugenesiow/super-image
+```
